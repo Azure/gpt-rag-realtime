@@ -28,7 +28,7 @@ class RealtimeEventHandler:
         """
         self.event_handlers = defaultdict(list)
 
-    def dispatch(self, event_name, event):
+    def dispatch(self, event_name, event, **kwargs):
         """
         Dispatch an event, invoking all registered handlers for that event.
         
@@ -40,9 +40,9 @@ class RealtimeEventHandler:
         for handler in handlers:
             if inspect.iscoroutinefunction(handler):
                 import asyncio
-                asyncio.create_task(handler(event))
+                asyncio.create_task(handler(event, **kwargs))
             else:
-                handler(event)
+                handler(event, **kwargs)
 
     async def wait_for_next_event(self, event_name):
         """

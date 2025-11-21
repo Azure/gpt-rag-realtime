@@ -1,1 +1,5 @@
 websockets==14.1
+numpy==2.3.4
+azure-communication-callautomation==1.4.0b1
+fastapi[standard]
+scipy==1.16.3

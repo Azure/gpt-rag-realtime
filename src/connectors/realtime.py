@@ -27,19 +27,19 @@ class RealtimeAPI(RealtimeEventHandler):
         self.api_version = os.getenv("OPENAI_API_VERSION", "2024-10-01-preview")
         self.azure_model_deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4-turbo")
 
-    async def _receive_messages(self):
+    async def _receive_messages(self,**kwargs):
         """
         Internal method to receive messages from the WebSocket.
         """
+        print("Receiving messages from WebSocket...")
         try:
             async for message in self.ws:
                 event = json.loads(message)
                 logging.info(f"[Websocket]Received message: {message}")
-                
                 if event.get("type") == "error":
                     logging.error(f"[Websocket]Error event received: {event}")
-                self.dispatch(f"server.{event.get('type')}", event)
-                self.dispatch("server.*", event)
+                self.dispatch(f"server.{event.get('type')}", event, **kwargs)
+                # self.dispatch("server.*", event, **kwargs)
         except websockets.ConnectionClosed:
             logging.warning("[Websocket]Connection closed.")
 
@@ -52,17 +52,17 @@ class RealtimeAPI(RealtimeEventHandler):
             raise RuntimeError("WebSocket is already connected.")
 
         ws_url = f"{self.openai_endpoint}/openai/realtime?api-version={self.api_version}&deployment={self.azure_model_deployment_name}"
-
+        
         self.ws = await websockets.connect(
             ws_url,
-            extra_headers={
+            additional_headers={
                 "api-key": self.api_key,
                 # "Content-Type": "application/json"
             }
         )
         logging.info("[Websocket]Connected to the real-time API WebSocket.")
-        asyncio.create_task(self._receive_messages())
-
+        return True
+    
     async def send(self, event_name, data=None):
         """
         Send a message to the WebSocket.
@@ -83,13 +83,11 @@ class RealtimeAPI(RealtimeEventHandler):
             "type": event_name,**data
         }
         
-        self.dispatch(f"client.{event_name}", event)
-        self.dispatch("client.*", event)
-
         logging.info(f"[Websocket]Sent message: {event}")
         await self.ws.send(json.dumps(event))
+        
 
-    async def _generate_event_id(self, prefix="evt_"):
+    def _generate_event_id(self, prefix="evt_"):
         """
         Generate a unique event ID using the current timestamp.
         
@@ -107,16 +105,3 @@ class RealtimeAPI(RealtimeEventHandler):
             await self.ws.close()
             self.ws = None
             logging.info("[Websocket]Disconnected from the real-time API WebSocket.")
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    rt_api = RealtimeAPI()
-
-    async def main():
-        await rt_api.connect()
-        await rt_api.send("ping", {"message": "Hello, Real-time API!"})
-        await asyncio.sleep(5)  # Keep the connection open for a while to receive messages
-        await rt_api.disconnect()
-
-    asyncio.run(main())
