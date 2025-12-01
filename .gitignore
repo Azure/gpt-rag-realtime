@@ -190,3 +190,4 @@ cython_debug/
 #.idea/
 
 .python_packages
+gpt-rag-orchestrator

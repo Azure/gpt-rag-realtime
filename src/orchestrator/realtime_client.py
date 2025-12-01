@@ -8,6 +8,7 @@ from utils.event import RealtimeEventHandler
 from utils.common import _read_prompt_from_txt, array_buffer_to_base64, recieve_audio_for_outbound_call, stop_audio
 
 from connectors.realtime import RealtimeAPI
+from .orc import OrcAgentLogicClient
 
 class VoiceAgentClient(RealtimeEventHandler):
     """
@@ -15,32 +16,9 @@ class VoiceAgentClient(RealtimeEventHandler):
     """
     def __init__(self, acs_ws=None):
         super().__init__()
-        self.system_prompt = _read_prompt_from_txt("agents/prompts/main.txt")
-        self.model: Optional[str]= None
-        self.temperature: Optional[float] = 0.7
-        self.max_response_output_tokens: Optional[int] = 1024
-        self.voice: Optional[str] = "alloy"
-        self.tools: list = []  # List of tools to be attached to the agent
         self.realtime = RealtimeAPI()
-        self.default_session_config: dict = {
-            # "id": "sessionId",
-            "turn_detection": {
-                "type": "server_vad",
-                "threshold": .6,
-                "prefix_padding_ms": 300,
-                "silence_duration_ms": 500
-            },
-            "input_audio_format": "pcm16",
-            "output_audio_format": "pcm16",
-            # "model": self.model,
-            "temperature": self.temperature,
-            "max_response_output_tokens": self.max_response_output_tokens,
-            "instructions": self.system_prompt,
-            "voice": self.voice,
-            "tool_choice":"auto" if len(self.tools) > 0 else "none",
-            "tools": self.tools
-        }
-        self.session_config = self.default_session_config.copy()
+        self.default_session_config: dict = {} #OrcAgentLogicClient.get_default_session_config()
+        self.session_config: dict = {}
         self._realtime_api_event_handler()
         self.is_active = True
         self.acs_ws = acs_ws
@@ -51,6 +29,10 @@ class VoiceAgentClient(RealtimeEventHandler):
         """
         if self.realtime.ws is not None:
             raise RuntimeError("WebSocket is already connected.")
+        
+        self.default_session_config = await OrcAgentLogicClient.get_default_session_config()
+        self.session_config = self.default_session_config.copy()
+
         await self.realtime.connect()
         await self.update_session()
         return True
