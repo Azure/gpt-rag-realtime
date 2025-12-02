@@ -2,6 +2,7 @@ from typing import Optional
 import asyncio
 import json
 import base64
+import uuid
 from fastapi import WebSocket
 
 from utils.event import RealtimeEventHandler
@@ -22,6 +23,8 @@ class VoiceAgentClient(RealtimeEventHandler):
         self._realtime_api_event_handler()
         self.is_active = True
         self.acs_ws = acs_ws
+        self.rt_session_id: Optional[str] = uuid.uuid4().hex
+        self.transcript_delta: str = ""
     
     async def connect(self):
         """
@@ -30,7 +33,7 @@ class VoiceAgentClient(RealtimeEventHandler):
         if self.realtime.ws is not None:
             raise RuntimeError("WebSocket is already connected.")
         
-        self.default_session_config = await OrcAgentLogicClient.get_default_session_config()
+        self.default_session_config = await OrcAgentLogicClient.get_session_config()
         self.session_config = self.default_session_config.copy()
 
         await self.realtime.connect()
@@ -115,6 +118,9 @@ class VoiceAgentClient(RealtimeEventHandler):
         self.realtime.on("client.*", self._on_logging_event)
         self.realtime.on("server.*", self._on_logging_event)
         self.realtime.on("server.response.audio.delta", self._on_response_audio_delta)
+        self.realtime.on("server.response.audio_transcript.delta", self._on_audio_transcript_delta)
+        self.realtime.on("server.response.audio_transcript.done", self._on_audio_transcript_done)
+        self.realtime.on("conversation.item.input_audio_transcription.completed", self._on_input_audio_transcription_completed)
     
     async def _on_logging_event(self, event):
         print("testing ")
@@ -131,6 +137,19 @@ class VoiceAgentClient(RealtimeEventHandler):
                 }
             }
             await self.acs_ws.send_text(json.dumps(acs_message))
+
+    async def _on_audio_transcript_delta(self, event):
+        transcript_delta = event.get("delta","")
+        self.transcript_delta += transcript_delta
+
+    async def _on_audio_transcript_done(self, event):
+        transcript = event.get("transcript","")
+        await OrcAgentLogicClient.save_transcript(self.rt_session_id, transcript,'assistant')
+        self.transcript_delta = ""
+
+    async def _on_input_audio_transcription_completed(self, event):
+        transcription = event.get("transcript","")
+        await OrcAgentLogicClient.save_transcript(self.rt_session_id, transcription,'user')
 
     def disconnect(self):
         """

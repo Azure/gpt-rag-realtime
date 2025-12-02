@@ -13,10 +13,6 @@ class OrcAgentLogicClient:
     async def call_orchestrator(body: Dict) -> Dict:
         """Fetch prompt template by name from Orchestrator."""
         try:
-            print({
-                    "X-API-KEY": os.environ.get("ORCHESTRATOR_API_KEY", "h7f5f3e2-3c9d-4e2b-8f4d-1a2b3c4d5e6f"),
-                     "Content-Type": "application/json",
-                })
             response = await http_client.post(
                 f"{ORCHESTRATOR_BASE_URL}/orchestrator",
                 json=body,
@@ -51,7 +47,7 @@ class OrcAgentLogicClient:
             raise
 
     @classmethod
-    async def get_default_session_config(cls) -> Dict:
+    async def get_session_config(cls,name="default") -> Dict:
         """Fetch default session configuration from Orchestrator."""
         try:
             body = {
@@ -60,7 +56,7 @@ class OrcAgentLogicClient:
                 "rt_action_request" :
                 {
                     "type": "get_session_config",
-                    "payload": {"name": "default"}
+                    "payload": {"name": name if name else "default"}
                 }
             }
             response = await cls.call_orchestrator(body)
@@ -68,7 +64,29 @@ class OrcAgentLogicClient:
         except httpx.HTTPError as e:
             logging.error(f"Error fetching session config: {e}")
             raise
-    
+
+    @classmethod
+    async def save_transcript(cls, session_id: str, transcript: str, role: str) -> None:
+        """Save transcript to Orchestrator."""
+        try:
+            body = {
+                "type": "rt_voice","ask":"none",
+                "conversation_id": session_id, 
+                "rt_action_request" :
+                {
+                    "type": "save_transcript",
+                    "payload": {
+                        "conversation_id": session_id,
+                        "transcript": transcript,
+                        "role": role
+                    }
+                }
+            }
+            await cls.call_orchestrator(body)
+        except httpx.HTTPError as e:
+            logging.error(f"Error saving transcript: {e}")
+            raise
+
 if __name__ == "__main__":
     import asyncio
 
