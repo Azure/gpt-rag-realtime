@@ -191,3 +191,4 @@ cython_debug/
 
 .python_packages
 gpt-rag-orchestrator
+gpt-rag-orchestrator-old

@@ -1,4 +1,6 @@
 import os
+import logging
+import uuid
 
 from azure.communication.callautomation import (
     CallAutomationClient,
@@ -11,7 +13,7 @@ from azure.communication.callautomation import (
     CallInvite,
 )
 
-import uuid
+
 class AcsConnector:
     def __init__(
         self,        
@@ -43,6 +45,7 @@ class AcsConnector:
                 enable_bidirectional=True,
                 audio_format=AudioFormat.PCM24_K_MONO
         )
+        logging.info(f"[ACS] AcsConnector initialized with connection ID: {self.acs_connection_id}")
 
     async def make_outbound_call(self, target_phone_number: str):
         """
@@ -59,6 +62,7 @@ class AcsConnector:
             source_caller_id_number=source_caller,
             media_streaming=self.media_streaming_options
         )
+        logging.info(f"[ACS] Outbound call initiated to {target_phone_number} with call connection ID: {call_conn_properties.call_connection_id}")
         return call_conn_properties
     
     async def handle_incoming_call(self, event_data: dict):
@@ -74,8 +78,9 @@ class AcsConnector:
                 callback_url=self.callback_url,
                 media_streaming= self.media_streaming_options
             )
-
+            logging.info(f"[ACS] Incoming call from {caller_id} answered with call connection ID: {answer_call_result.call_connection_id}")
             return True
         except Exception as e:
-            pass
+            logging.error(f"[ACS] Error handling incoming call: {e}")
+            return False
     

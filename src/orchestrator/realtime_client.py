@@ -3,6 +3,7 @@ import asyncio
 import json
 import base64
 import uuid
+import logging
 from fastapi import WebSocket
 
 from utils.event import RealtimeEventHandler
@@ -18,13 +19,25 @@ class VoiceAgentClient(RealtimeEventHandler):
     def __init__(self, acs_ws=None):
         super().__init__()
         self.realtime = RealtimeAPI()
-        self.default_session_config: dict = {} #OrcAgentLogicClient.get_default_session_config()
         self.session_config: dict = {}
         self._realtime_api_event_handler()
         self.is_active = True
         self.acs_ws = acs_ws
         self.rt_session_id: Optional[str] = uuid.uuid4().hex
         self.transcript_delta: str = ""
+        self.voice: Optional[str] = "alloy"
+        self.default_session_config: dict ={
+            "turn_detection": {
+                "type": "server_vad",
+                "threshold": .6,
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": 500
+            },
+            "input_audio_format": "pcm16",
+            "output_audio_format": "pcm16",
+            "voice": self.voice
+        }
+        logging.info(f"[VoiceAgentClient] Initialized with RT session ID: {self.rt_session_id}")
     
     async def connect(self):
         """
@@ -33,11 +46,13 @@ class VoiceAgentClient(RealtimeEventHandler):
         if self.realtime.ws is not None:
             raise RuntimeError("WebSocket is already connected.")
         
-        self.default_session_config = await OrcAgentLogicClient.get_session_config()
+        self.default_session_config.update(await OrcAgentLogicClient.get_session_config())
         self.session_config = self.default_session_config.copy()
+        logging.info(f"[VoiceAgentClient] Connecting to the real-time API...{self.session_config}")
 
         await self.realtime.connect()
         await self.update_session()
+        logging.info("[VoiceAgentClient] Connected to the real-time API and session updated.")
         return True
     
     def is_connected(self) -> bool:
@@ -83,13 +98,14 @@ class VoiceAgentClient(RealtimeEventHandler):
                                 "input_audio_buffer.append",
                                 audio_message
                             )
+                            logging.info("[VoiceAgentClient] Sent audio message to real-time API.")
                 except asyncio.TimeoutError:
                     continue
                 except Exception as e:
-                    print("Error while in ACS -> OpenAI ",e)
+                    logging.error(f"Error while in ACS -> OpenAI: {e}")
                     break
         except Exception as e:
-            print("Fatal error in audio strem")
+            logging.error("Fatal error in audio stream", exc_info=e)
 
     # async def handle_openai_audio_to_acs(self):
     #     try:
@@ -106,8 +122,9 @@ class VoiceAgentClient(RealtimeEventHandler):
                 self.handle_acs_audio_to_openai(),
                 self.realtime._receive_messages()  #
             )
+            
         except Exception as e:
-            print("session error",e)
+            logging.error(f"Session error: {e}", exc_info=e)
         finally:
             await self.cleanup()
 
@@ -123,7 +140,7 @@ class VoiceAgentClient(RealtimeEventHandler):
         self.realtime.on("conversation.item.input_audio_transcription.completed", self._on_input_audio_transcription_completed)
     
     async def _on_logging_event(self, event):
-        print("testing ")
+        logging.info(f"[VoiceAgentClient] Logging event: {event}")
 
     async def _on_response_audio_delta(self, event):
         audio_base64 = event.get("delta","")

@@ -31,7 +31,7 @@ class RealtimeAPI(RealtimeEventHandler):
         """
         Internal method to receive messages from the WebSocket.
         """
-        print("Receiving messages from WebSocket...")
+        
         try:
             async for message in self.ws:
                 event = json.loads(message)
