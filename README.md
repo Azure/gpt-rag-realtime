@@ -40,6 +40,61 @@ The machine used to customize and or deploy the service should have:
 
 Coming soon...
 
+
+## 🚀 Running the Project Locally
+
+Follow the steps below to run the application in your local environment.
+
+### 1. Start ngrok
+
+Expose your local server (running on port **8000**) using ngrok:
+
+```bash
+ngrok http 8000
+```
+
+Copy the **unique ngrok URL** generated — you will need it for the callback and WebSocket endpoints.
+
+---
+
+### 2. Set Required Environment Variables
+
+Create a `.env` file or export the variables in your terminal.
+
+```bash
+OPENAI_API_BASE=https://<<service-name>>.openai.azure.com
+OPENAI_API_KEY=<<azure-openai-token>>
+AZURE_OPENAI_DEPLOYMENT_NAME=<<realtime-model-deployment-name>>
+
+ACS_CONNECTION_STRING=<<acs-connection-string>>
+ACS_PHONE_NUMBER=<<acs-phone-number>>
+
+ACS_CALLBACK_URL_HOST=https://<<unique-ngrok-url>>.ngrok-free.app
+ACS_CALLBACK_URL=${ACS_CALLBACK_URL_HOST}/api/callbacks
+ACS_WEBSOCKET_URL=wss://<<unique-ngrok-url>>.ngrok-free.app/api/media
+```
+
+---
+
+### 3. Run the Application
+
+Use Python to start the service:
+
+```bash
+python .\src\main.py
+```
+
+---
+
+## 📦 Required Azure Services
+
+Ensure the following Azure resources are configured:
+
+1. **Azure OpenAI** – with a deployment of a *Realtime model*
+2. **Azure Communication Services (ACS)**
+
+
+
 ## Contributing
 
 We appreciate contributions! See [CONTRIBUTING.md](https://azure.github.io/GPT-RAG/contributing/) for guidelines on the Contributor License Agreement (CLA), code of conduct, and submitting pull requests.
