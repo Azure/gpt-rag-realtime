@@ -19,6 +19,7 @@ _active_call_connection_id: Optional[str] = None
 _acs_phone_number: Optional[str] = None
 _live_agent_phone_number: str = "+19722135344"  # Default live agent number
 _live_agent_connected: bool = False  # Flag to track if live agent is connected
+_live_agent_transfer_pending: bool = False  # Flag to defer transfer until message finishes
 
 _search_tool_schema = {
     "type": "function",
@@ -57,72 +58,27 @@ _live_agent_tool_schema = {
 
 async def _live_agent_tool() -> ToolResult:
     """
-    Transfer the call to a live agent by adding them as a participant.
-    Once connected, the AI will stop processing and the call becomes phone-only.
+    Mark live agent transfer as pending. The actual ACS transfer is deferred
+    until after the transfer message finishes playing (response.done in app.py).
     """
-    global _live_agent_connected
+    global _live_agent_transfer_pending
     
-    print(f"\033[93m[LIVE AGENT] Attempting to add live agent to call.\033[0m")
+    print(f"\033[93m[LIVE AGENT] Transfer requested — will execute after message plays.\033[0m")
     logger.info(f"Live agent tool invoked. Call ID: {_active_call_connection_id}")
     
     if not _call_automation_client:
-        error_msg = "Call automation client not initialized."
-        logger.error(error_msg)
-        return ToolResult("I'm sorry, but I'm unable to transfer you to a live agent at this time. Please try again later.", ToolResultDirection.TO_SERVER)
+        logger.error("Call automation client not initialized.")
+        return ToolResult("I'm sorry, but I'm unable to transfer you right now. Please try again later.", ToolResultDirection.TO_SERVER)
     
     if not _active_call_connection_id:
-        error_msg = "No active call connection available for transfer."
-        logger.error(error_msg)
+        logger.error("No active call connection available for transfer.")
         return ToolResult("I'm sorry, but I couldn't find an active call to transfer. Please try again.", ToolResultDirection.TO_SERVER)
     
-    try:
-        # Get the call connection
-        call_connection_client = _call_automation_client.get_call_connection(_active_call_connection_id)
-        
-        # Create participant identifier
-        live_agent_participant = PhoneNumberIdentifier(_live_agent_phone_number)
-        source_caller = PhoneNumberIdentifier(_acs_phone_number)
-        
-        logger.info(f"Adding live agent {_live_agent_phone_number} to call {_active_call_connection_id}")
-        print(f"\033[92m[LIVE AGENT] Adding {_live_agent_phone_number} to call...\033[0m")
-        
-        # Add participant to the call
-        result = call_connection_client.add_participant(
-            target_participant=live_agent_participant,
-            source_caller_id_number=source_caller
-        )
-        
-        # Stop media streaming to disconnect AI from the call
-        try:
-            call_connection_client.stop_media_streaming()
-            logger.info("Media streaming stopped successfully.")
-            print(f"\033[92m[LIVE AGENT] Media streaming stopped.\033[0m")
-        except Exception as streaming_error:
-            logger.warning(f"Could not stop media streaming: {str(streaming_error)}")
-            # Continue anyway - the flag will stop processing
-        
-        # Set the flag to stop AI processing
-        _live_agent_connected = True
-        
-        logger.info(f"Live agent added successfully to call {_active_call_connection_id}")
-        logger.info(f"AI processing stopped. Call is now phone-only between customer and live agent.")
-        print(f"\033[92m[LIVE AGENT] Successfully added live agent to the call.\033[0m")
-        print(f"\033[92m[LIVE AGENT] AI processing stopped. Call is now phone-only.\033[0m")
-        
-        # Return success message to be spoken to the customer
-        return ToolResult(
-            "Please hold while I connect you to a live agent. They will be with you shortly.",
-            ToolResultDirection.TO_SERVER
-        )
-        
-    except Exception as e:
-        error_msg = f"Error adding live agent to call: {str(e)}"
-        logger.error(error_msg)
-        print(f"\033[91m[LIVE AGENT ERROR] {error_msg}\033[0m")
-        return ToolResult(
-            "I'm sorry, but I'm having trouble connecting you to a live agent right now. Please try again in a moment.",
-            ToolResultDirection.TO_SERVER
-        )
+    _live_agent_transfer_pending = True
+    return ToolResult(
+        "I am connecting you to the next available representative. Please hold.",
+        ToolResultDirection.TO_SERVER
+    )
 
 
 async def _search_tool(
@@ -237,11 +193,58 @@ def set_live_agent_phone_number(phone_number: str):
 
 
 def is_live_agent_connected() -> bool:
-    """
-    Check if a live agent has been connected to the call.
-    When true, AI processing should stop.
-    
-    Returns:
-        bool: True if live agent is connected, False otherwise
-    """
+    """Check if a live agent has been connected to the call."""
     return _live_agent_connected
+
+
+def is_live_agent_transfer_pending() -> bool:
+    """Check if a live agent transfer is waiting to execute after message plays."""
+    return _live_agent_transfer_pending
+
+
+def get_live_agent_phone_number() -> str:
+    """Return the live agent phone number."""
+    return _live_agent_phone_number
+
+
+def reset_call_state():
+    """Reset flags for a new call session. Does NOT clear call_connection_id (set by ACS callback)."""
+    global _live_agent_connected, _live_agent_transfer_pending
+    _live_agent_connected = False
+    _live_agent_transfer_pending = False
+    logger.info("Call state reset for new session.")
+
+
+def execute_live_agent_transfer():
+    """
+    Execute the actual ACS transfer: add participant, stop media streaming, set connected flag.
+    Call AFTER the transfer message has finished playing.
+    """
+    global _live_agent_connected, _live_agent_transfer_pending
+    _live_agent_transfer_pending = False
+    
+    try:
+        call_connection_client = _call_automation_client.get_call_connection(_active_call_connection_id)
+        live_agent_participant = PhoneNumberIdentifier(_live_agent_phone_number)
+        source_caller = PhoneNumberIdentifier(_acs_phone_number)
+        
+        logger.info(f"Executing transfer: adding {_live_agent_phone_number} to call {_active_call_connection_id}")
+        print(f"\033[92m[LIVE AGENT] Adding {_live_agent_phone_number} to call...\033[0m")
+        
+        call_connection_client.add_participant(
+            target_participant=live_agent_participant,
+            source_caller_id_number=source_caller
+        )
+        
+        try:
+            call_connection_client.stop_media_streaming()
+            print(f"\033[92m[LIVE AGENT] Media streaming stopped.\033[0m")
+        except Exception as e:
+            logger.warning(f"Could not stop media streaming: {e}")
+        
+        _live_agent_connected = True
+        print(f"\033[92m[LIVE AGENT] Transfer complete. AI processing stopped.\033[0m")
+        
+    except Exception as e:
+        logger.error(f"Error executing live agent transfer: {e}")
+        print(f"\033[91m[LIVE AGENT ERROR] {e}\033[0m")

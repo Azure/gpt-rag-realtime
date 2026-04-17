@@ -18,8 +18,9 @@ from azure.core.messaging import CloudEvent
 from azure.core.credentials import AzureKeyCredential
 from azure.identity import AzureDeveloperCliCredential, DefaultAzureCredential
 from dotenv import load_dotenv
-from ragtools import attach_rag_tools, set_active_call_connection, set_live_agent_phone_number, is_live_agent_connected
+from ragtools import attach_rag_tools, set_active_call_connection, set_live_agent_phone_number, is_live_agent_connected, is_live_agent_transfer_pending, execute_live_agent_transfer, reset_call_state, get_live_agent_phone_number
 from toolshelper import Tool, ToolResult, ToolResultDirection, RTToolCall
+from prompts import SYSTEM_MESSAGE, GREETING_INSTRUCTIONS
 from typing import Any, Callable, Optional
 import time
 
@@ -37,6 +38,12 @@ logger = logging.getLogger("voicerag")
 
 tools: dict[str, Tool] = {}
 _tools_pending = {}
+_greeting_in_progress = False
+_session_configured = False
+
+# Track active WebSocket connections so we can tear down the previous session on new call
+_active_acs_ws: Optional[web.WebSocketResponse] = None
+_active_openai_ws: Optional[aiohttp.ClientWebSocketResponse] = None
 ### Load environment variables from .env file
 load_dotenv()
 logger.info("Loading environment variables from .env file")
@@ -45,7 +52,7 @@ api_version = os.environ.get("AZURE_OPENAI_API_VERSION")
 deployment = os.environ.get("AZURE_OPENAI_REALTIME_DEPLOYMENT")
 endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
 
-# Use Azure credential instead of API key
+# Use managed identity (DefaultAzureCredential) for Azure OpenAI auth
 azure_credential = DefaultAzureCredential()
 
 # Your ACS resource connection string
@@ -70,33 +77,7 @@ voice_choice: Optional[str] = None
 
 voice_choice =  "alloy"
 
-system_message ="""
-            You are a helpful assistant who only answers questions using information found via the "search" tool in the knowledge base. Follow these guidelines:
-            * Greetings:
-                Proactively greet the customer as soon as the call is connected. For example:
-                "Hello, This is Wendy, your dedicated Verizon support concierge. I can answer questions about various Verizon equipments.
-                How can I assist you today?"
-            * Answer Requirements:
-                - Keep answers extremely brief—ideally a single sentence—since the user listens via audio.
-                - Never read out file names, source names, or keys.
-                - Maintain a friendly, approachable tone and avoid sounding robotic.
-            * Response Process:
-                - Search First: Always use the "search" tool to check the knowledge base before answering.
-                - Inform the User: Always verbally indicate you're looking up the information (e.g., "Let me check that," "I'm taking a look at it," "Hmm, let me see") before accessing datastore tools.
-                - Produce a Short Answer: Provide the shortest, most direct answer possible. If the answer isn't in the knowledge base, say, "I don't know the answer for that."
-                - Missing Information: If the answer isn't in the knowledge base, say, "I don't know the answer for that."
-                - Handle Invalid Input: If the request is empty or invalid, ask the customer to repeat without ending the conversation.
-            * Live Agent Transfer:
-                - If the customer requests to speak with a representative, human, agent, or live person (e.g., "Can I talk to a human?", "representative", "transfer me to someone"), respond with a professional transfer message such as:
-                  * "I am connecting you to the next available representative. Please hold."
-                  * "Let me transfer you to a live agent. One moment please."
-                  * "I'll connect you with a representative right away. Please hold."
-                - After saying the transfer message, immediately call the "live_agent" tool.
-                - Do not search the knowledge base for such requests; directly invoke the live_agent tool.
-                - Maintain a calm, professional tone when transferring the call.
-            * Conversation Closure:
-                At the very end of the conversation, thank the customer using a happy tone.
-        """.strip()
+system_message = SYSTEM_MESSAGE
 
 
 search_key = os.environ.get("AZURE_SEARCH_API_KEY")
@@ -125,7 +106,31 @@ call_automation_client = CallAutomationClient.from_connection_string(ACS_CONNECT
 # Handler for the /outboundCall POST route
 # this function makes an outbound call to the target phone number entered in the index.html page and starts media streaming
 async def outbound_call(request: web.Request) -> web.Response:
+    global _active_acs_ws, _active_openai_ws, _greeting_in_progress, _session_configured, _tools_pending
     try:
+        # ---- Tear down any previous session ----
+        if _active_openai_ws and not _active_openai_ws.closed:
+            try:
+                await _active_openai_ws.close()
+                logger.info("[NEW CALL] Closed previous OpenAI WebSocket.")
+            except Exception:
+                pass
+        if _active_acs_ws and not _active_acs_ws.closed:
+            try:
+                await stop_audio(_active_acs_ws)
+                logger.info("[NEW CALL] Sent StopAudio to previous ACS WebSocket.")
+            except Exception:
+                pass
+        _active_openai_ws = None
+        _active_acs_ws = None
+
+        # ---- Reset all session state ----
+        _greeting_in_progress = False
+        _session_configured = False
+        _tools_pending = {}
+        reset_call_state()
+        logger.info("[NEW CALL] All session state reset.")
+
         data = await request.json()
         # Access the phone number and participant number from the JSON payload from index.html page.
         TARGET_PHONE_NUMBER = data.get("phone")
@@ -178,19 +183,20 @@ async def outbound_call(request: web.Request) -> web.Response:
 async def websocket_handler(request):
     print("Client connected to WebSocket")
 
+    global _active_acs_ws
     acs_ws = web.WebSocketResponse()
     await acs_ws.prepare(request)
+    _active_acs_ws = acs_ws
 
     async for msg in acs_ws:
-        # print(f"Received message: {msg}")
         if msg.type == web.WSMsgType.TEXT:
-            # print(f"Received message: {msg.data}")
-   
-            ### Sending ACS data to OPENAI which initiates the session and opens the websockets for sending and receiving messages from OpenAI
+            # First TEXT message starts the OpenAI session; it consumes all further ACS messages internally
             await handle_openai_communication(acs_ws)
+            break  # Only one OpenAI session per WebSocket connection
         elif msg.type == web.WSMsgType.ERROR:
             print(f"WebSocket connection closed with exception {acs_ws.exception()}")
- 
+
+    _active_acs_ws = None
     print("WebSocket connection closed")
 
 
@@ -223,7 +229,39 @@ async def api_callbacks(request: web.Request) -> web.Response:
                 print(f"Code:->{event.data['resultInformation']['code']}, Subcode:-> {event.data['resultInformation']['subCode']}")
                 print(f"Message:->{event.data['resultInformation']['message']}")
             elif event.type == "Microsoft.Communication.CallDisconnected":
-                pass
+                print(f"\033[91m[CALL] CallDisconnected for {call_connection_id}\033[0m")
+                # If live agent was connected, ensure the whole call is torn down
+                if is_live_agent_connected():
+                    print(f"\033[91m[CALL] Live agent session active. Hanging up for everyone.\033[0m")
+                    try:
+                        call_connection_client.hang_up(is_for_everyone=True)
+                    except Exception as e:
+                        logger.warning(f"Error hanging up on disconnect: {e}")
+                reset_call_state()
+            elif event.type == "Microsoft.Communication.ParticipantsUpdated":
+                # When live agent is connected, any participant leaving should end the call
+                participants = event.data.get("participants", [])
+                print(f"\033[93m[CALL] ParticipantsUpdated: {len(participants)} participants\033[0m")
+                for p in participants:
+                    print(f"  Participant: {p}")
+                if is_live_agent_connected():
+                    # Check if live agent is still in the call
+                    live_agent_still_in = False
+                    target_still_in = False
+                    agent_number = get_live_agent_phone_number()
+                    for p in participants:
+                        phone_id = p.get("identifier", {}).get("phoneNumber", {}).get("value", "")
+                        if phone_id and agent_number and phone_id.replace("+", "") == agent_number.replace("+", ""):
+                            live_agent_still_in = True
+                        elif phone_id:
+                            target_still_in = True
+                    if not live_agent_still_in or not target_still_in:
+                        who_left = "live agent" if not live_agent_still_in else "caller"
+                        print(f"\033[91m[CALL] {who_left} left. Hanging up the call.\033[0m")
+                        try:
+                            call_connection_client.hang_up(is_for_everyone=True)
+                        except Exception as e:
+                            logger.warning(f"Error hanging up call: {e}")
 
             return web.Response(status=200)
 
@@ -288,37 +326,37 @@ async def _process_message_to_openai(msg: str, ws: web.WebSocketResponse) -> Opt
 
 #Handle Open AI Communication
 async def handle_openai_communication(acs_ws: web.WebSocketResponse):
+    global _greeting_in_progress, _session_configured, _tools_pending
+    # ---- Reset ALL session state for this new call ----
+    _greeting_in_progress = False
+    _session_configured = False
+    _tools_pending = {}
+    reset_call_state()
+    print("\033[92m[SESSION] State reset for new call.\033[0m")
+
     print("WebSocket connection attempt.")
-    # Get access token from Azure credential for Azure OpenAI
+    # Get a fresh access token from managed identity
     token = azure_credential.get_token("https://cognitiveservices.azure.com/.default")
     headers = {"Authorization": f"Bearer {token.token}"}
     params = {"api-version": api_version, "deployment": deployment}
 
     async with aiohttp.ClientSession(base_url=endpoint) as session:
         async with session.ws_connect("/openai/realtime", headers=headers, params=params) as openai_ws:
+            global _active_openai_ws
+            _active_openai_ws = openai_ws
 
+            # Minimal initial config: VAD disabled during greeting to prevent interruption.
+            # VAD, tools, and system message are added after the greeting completes.
             message = {
                 "type": "session.update",
                 "session": {
-                    "id": "sessionId",
-                    "turn_detection": {
-                            "type": "server_vad",
-                            "threshold": 0.6,
-                            "prefix_padding_ms": 300,
-                            "silence_duration_ms": 500
-                        },
-                        "input_audio_format": "pcm16",
-                        "output_audio_format": "pcm16",
-                    "model": model,
-                    "temperature": temperature,
-                    "max_response_output_tokens": max_tokens,
-                    "instructions": system_message,
+                    "turn_detection": None,
+                    "input_audio_format": "pcm16",
+                    "output_audio_format": "pcm16",
                     "voice": voice_choice,
-                    "tool_choice": "auto" if len(tools) > 0 else "none",
-                    "tools": [tool.schema for tool in tools.values()]
                 }
             }
-            openai_ws.send_json(message) ##set things up for the session
+            await openai_ws.send_json(message)
 
             print("\033[93mSent message to OpenAI.\033[0m")
 
@@ -334,19 +372,24 @@ async def handle_openai_communication(acs_ws: web.WebSocketResponse):
                     
                     if msg.type == web.WSMsgType.TEXT:
                         data = json.loads(msg.data)
-                        # data = msg.data
                         kind = data['kind']
                         if kind == "AudioData":
                             new_msg = await _process_message_to_openai(msg, acs_ws)
                             if new_msg:
-                                await send_session_update(openai_ws)
-                                await openai_ws.send_str(json.dumps(new_msg))
-                                # await send_session_update(openai_ws)
-                    else:
-                        logger.warning("Received empty or invalid message from OpenAI.")
-                        print("Received empty or invalid message from OpenAI.")
+                                if not _session_configured:
+                                    # Skip sending audio until session is fully configured after greeting
+                                    continue
+                                try:
+                                    await openai_ws.send_str(json.dumps(new_msg))
+                                except Exception as e:
+                                    logger.warning(f"Failed to send audio to OpenAI: {e}")
+                                    break
+                    elif msg.type == web.WSMsgType.ERROR:
+                        logger.warning("ACS WebSocket error.")
+                        break
 
             async def receive_from_openai():
+                global _greeting_in_progress, _session_configured
                 print("\033[93mReceived message from openAI.\033[0m")
                 async for message in openai_ws:
                     # Check if live agent is connected - if so, stop processing
@@ -367,16 +410,15 @@ async def handle_openai_communication(acs_ws: web.WebSocketResponse):
                         match data["type"]:
                             case "session.created":
                                 print("Session Created Message")
-                                # print(f"  Session Id: {data["session"]["id"]}")
                                 session = data["session"]
                                 session["instructions"] = ""
                                 session["tools"] = []
                                 session["voice"] = voice_choice
                                 session["tool_choice"] = "none"
                                 session["max_response_output_tokens"] = None
-                                await receive_audio_for_outbound(data["session"], acs_ws)  
 
                                 #proactively greet the customer as soon as the call is connected.
+                                _greeting_in_progress = True
                                 greeting = {
                                     "type": "response.create",
                                     "response": {
@@ -384,7 +426,7 @@ async def handle_openai_communication(acs_ws: web.WebSocketResponse):
                                         "audio",
                                         "text"
                                         ],
-                                        "instructions": "Introduce urself." + system_message,
+                                        "instructions": GREETING_INSTRUCTIONS,
                                         "voice": "alloy",
                                         "output_audio_format": "pcm16"
                                     }
@@ -404,25 +446,67 @@ async def handle_openai_communication(acs_ws: web.WebSocketResponse):
                                 print("Input Audio Buffer Cleared Message")
                                 pass
                             case "input_audio_buffer.speech_started":
-                                print(f"Voice activity detection started at {data["audio_start_ms"]} [ms]")
-                                await stop_audio(acs_ws)
-                                pass
+                                print(f"Voice activity detection started at {data['audio_start_ms']} [ms]")
+                                if _greeting_in_progress:
+                                    print("\033[93m[GREETING] Ignoring barge-in during greeting.\033[0m")
+                                elif is_live_agent_transfer_pending():
+                                    print("\033[93m[TRANSFER] Ignoring barge-in during transfer message.\033[0m")
+                                    # Discard any user audio so VAD doesn't commit it and interrupt the transfer response
+                                    try:
+                                        await openai_ws.send_json({"type": "input_audio_buffer.clear"})
+                                    except Exception:
+                                        pass
+                                else:
+                                    # Cancel the current OpenAI response so it stops generating audio
+                                    try:
+                                        await openai_ws.send_json({"type": "response.cancel"})
+                                    except Exception:
+                                        pass
+                                    await stop_audio(acs_ws)
                             case "input_audio_buffer.speech_stopped":
                                 pass
+                            case "input_audio_buffer.committed":
+                                # If transfer is pending, discard any committed user audio
+                                if is_live_agent_transfer_pending():
+                                    print("\033[93m[TRANSFER] Clearing committed audio during transfer.\033[0m")
+                                    try:
+                                        await openai_ws.send_json({"type": "input_audio_buffer.clear"})
+                                    except Exception:
+                                        pass
                             case "conversation.item.input_audio_transcription.completed":
                                 print(f" User:-- {data["transcript"]}")
                             case "conversation.item.input_audio_transcription.failed":
                                 print(f"  Error: {data["error"]}")
                             case "response.done":
-                                # print("Response Done Message")
                                 print("\033[92mResponse Done Message\033[0m")
-                                print(f"  Response Id: {data["response"]["id"]}")
+                                print(f"  Response Id: {data['response']['id']}")
 
-                                if len(_tools_pending) > 0:
-                                    _tools_pending.clear() # Any chance tool calls could be interleaved across different outstanding responses?
-                                    await openai_ws.send_json({
-                                        "type": "response.create"
-                                    })
+                                # --- Greeting just finished ---
+                                if _greeting_in_progress:
+                                    _greeting_in_progress = False
+                                    print("\033[92m[GREETING] Complete. Configuring session.\033[0m")
+                                    await openai_ws.send_json({"type": "input_audio_buffer.clear"})
+                                    await send_session_update(openai_ws)
+                                    _session_configured = True
+                                    print("\033[92m[SESSION] Ready for user questions.\033[0m")
+
+                                # --- Live agent transfer message just finished ---
+                                if is_live_agent_transfer_pending():
+                                    print("\033[92m[TRANSFER] Message played. Cleaning up and transferring...\033[0m")
+                                    # Clear input buffer so VAD doesn't trigger another response
+                                    try:
+                                        await openai_ws.send_json({"type": "input_audio_buffer.clear"})
+                                    except Exception:
+                                        pass
+                                    # Wait for ACS to finish playing the buffered audio on the phone
+                                    await asyncio.sleep(5)
+                                    # Now stop audio and execute transfer
+                                    await stop_audio(acs_ws)
+                                    execute_live_agent_transfer()
+                                    break
+
+                                # Clear any pending tool tracking (response.create already sent in output_item.done)
+                                _tools_pending.clear()
                                 if "response" in data:
                                     # replace = False
                                     output_list = data["response"]["output"]
@@ -448,11 +532,10 @@ async def handle_openai_communication(acs_ws: web.WebSocketResponse):
                                 if "item" in data and data["item"]["type"] == "function_call":
                                     print(f"INSIDE function call")
                                     item = data["item"]
-                                    # tool_call = _tools_pending[data["item"]["call_id"]]
                                     tool = tools[item["name"]]
                                     args = item["arguments"]
                                     result = await tool.target(json.loads(args))
-                                    # print(f"INSIDE function call 1")
+                                    print(f"\033[92m[TOOL] Sending function_call_output for {item['name']}\033[0m")
                                     await openai_ws.send_json({
                                         "type": "conversation.item.create",
                                         "item": {
@@ -461,6 +544,9 @@ async def handle_openai_communication(acs_ws: web.WebSocketResponse):
                                             "output": result.to_text() if result.destination == ToolResultDirection.TO_SERVER else ""
                                         }
                                     })
+                                    # Immediately trigger model to respond with the tool results
+                                    print(f"\033[92m[TOOL] Sending response.create after tool output\033[0m")
+                                    await openai_ws.send_json({"type": "response.create"})
                                     if result.destination == ToolResultDirection.TO_CLIENT:
                                         print(f"INSIDE function call to CLIENT")
                                         update_message = {
@@ -474,6 +560,7 @@ async def handle_openai_communication(acs_ws: web.WebSocketResponse):
 
 
             await asyncio.gather(receive_from_acs(), receive_from_openai())
+            _active_openai_ws = None
 
 
 
@@ -482,9 +569,17 @@ async def send_session_update(openai_ws: aiohttp.ClientWebSocketResponse):
     session_update_message = {
         "type": "session.update",
         "session": {
+            "modalities": ["text", "audio"],
             "instructions": system_message,
+            "turn_detection": {
+                "type": "server_vad",
+                "threshold": 0.8,
+                "prefix_padding_ms": 500,
+                "silence_duration_ms": 800
+            },
             "tool_choice": "auto" if len(tools) > 0 else "none",
             "tools": [tool.schema for tool in tools.values()],
+            "input_audio_transcription": {"model": "whisper-1"},
             "temperature": temperature if temperature else 0.7,
             "max_response_output_tokens": max_tokens or 500,
             "voice": voice_choice or "alloy"
