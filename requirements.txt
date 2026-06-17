@@ -1,0 +1,6 @@
+aiohttp
+azure-communication-callautomation==1.4.0b1
+azure-search-documents==11.6.0b9
+azure-core 
+azure-identity
+python-dotenv==1.0.1
